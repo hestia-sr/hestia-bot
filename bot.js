@@ -35,6 +35,7 @@ function saveOrders(o) { fs.writeFileSync(ORDERS_FILE, JSON.stringify(o, null, 2
 /* ---------- util ---------- */
 const rupiah = (n) => 'Rp' + Number(n || 0).toLocaleString('id-ID');
 const tgl = (ts) => new Date(ts).toLocaleString('id-ID', { day: 'numeric', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+const escHtml = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 async function gw(pathname, opts = {}) {
   const r = await fetch(GATEWAY_URL + pathname, {
     ...opts,
@@ -113,12 +114,28 @@ async function askEmail(chatId, msgId) {
 
 function pickerKeyboard(s) {
   const rows = s.poolList.map((m, i) => {
+    // Tombol inline Telegram hanya teks polos (tidak mendukung coretan) —
+    // model belum aktif diberi label jelas dan tidak bisa dipilih.
+    if (!m.active) return [{ text: m.alias + ' (belum aktif)', callback_data: 'pk:' + i }];
     const on = s.picks.includes(m.id);
     return [{ text: (on ? '[x] ' : '[ ] ') + m.alias, callback_data: 'pk:' + i }];
   });
   rows.push([{ text: 'Selesai pilih (' + s.picks.length + '/' + s.needPick + ')', callback_data: 'pk:done' }]);
   rows.push([{ text: 'Batal', callback_data: 'menu:buy' }]);
   return { inline_keyboard: rows };
+}
+
+// Teks pesan di atas picker (parse_mode HTML agar coretan <s> tampil).
+// Menampilkan SEMUA model; yang belum aktif dicoreng + dijelaskan.
+function pickerText(s, p) {
+  const label = (p && p.pool === 'mid') ? 'model menengah' : 'model mahal';
+  let text = 'Paket ' + p.name + ' — pilih TEPAT ' + s.needPick + ' ' + label + ':\n(Ketuk untuk centang/hapus centang)';
+  const inactive = s.poolList.filter((m) => !m.active);
+  if (inactive.length) {
+    text += '\n\nYang dicoreng belum aktif ya:\n' +
+      inactive.map((m) => '<s>' + escHtml(m.alias) + '</s>').join('\n');
+  }
+  return text;
 }
 
 async function startPicker(chatId, msgId, plan) {
@@ -129,20 +146,32 @@ async function startPicker(chatId, msgId, plan) {
     return;
   }
   const poolKey = plan.pool === 'mid' ? 'mid' : 'mahal';
-  const list = (r.pools[poolKey] || []).filter((m) => m.active);
-  if (list.length < plan.pick) {
-    await bot.sendMessage(chatId, 'Maaf, model aktif untuk paket ' + plan.name + ' saat ini hanya ' + list.length +
-      ' (butuh ' + plan.pick + '). Coba lagi nanti atau hubungi admin.');
+  // Tampilkan SEMUA model (aktif + belum aktif); yang belum aktif tidak bisa dipilih.
+  const list = r.pools[poolKey] || [];
+  const activeCount = list.filter((m) => m.active).length;
+  if (activeCount < plan.pick) {
+    // Jujur: paket belum bisa dibeli — jangan biarkan pembeli nyangkut tanpa penjelasan.
+    const inactive = list.filter((m) => !m.active);
+    const labelPl = poolKey === 'mid' ? 'model menengah' : 'model mahal';
+    let text = 'Paket ' + plan.name + ' belum bisa dibeli saat ini.\n\n' +
+      'Butuh tepat ' + plan.pick + ' pilihan, tapi ' + labelPl + ' yang aktif baru ' + activeCount + '.';
+    if (inactive.length) {
+      text += '\n\nYang dicoreng belum aktif ya:\n' +
+        inactive.map((m) => '<s>' + escHtml(m.alias) + '</s>').join('\n');
+    }
+    text += '\n\nCoba lagi nanti setelah modelnya aktif, atau pilih paket lain.';
+    const kb = { reply_markup: { inline_keyboard: [[{ text: 'Kembali', callback_data: 'menu:buy' }]] } };
+    if (msgId) await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, parse_mode: 'HTML', ...kb });
+    else await bot.sendMessage(chatId, text, { parse_mode: 'HTML', ...kb });
     return;
   }
   s.step = 'picking';
   s.poolList = list;
   s.picks = [];
   s.needPick = plan.pick;
-  const label = poolKey === 'mid' ? 'model menengah' : 'model mahal';
-  const text = 'Paket ' + plan.name + ' — pilih TEPAT ' + plan.pick + ' ' + label + ':\n(Ketuk untuk centang/hapus centang)';
-  if (msgId) await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, reply_markup: pickerKeyboard(s) });
-  else await bot.sendMessage(chatId, text, { reply_markup: pickerKeyboard(s) });
+  const text = pickerText(s, plan);
+  if (msgId) await bot.editMessageText(text, { chat_id: chatId, message_id: msgId, reply_markup: pickerKeyboard(s), parse_mode: 'HTML' });
+  else await bot.sendMessage(chatId, text, { reply_markup: pickerKeyboard(s), parse_mode: 'HTML' });
 }
 
 async function sendPayment(chatId) {
@@ -234,6 +263,10 @@ bot.on('callback_query', async (q) => {
       const i = parseInt(data.slice(3), 10);
       const m = s.poolList[i];
       if (!m) return;
+      if (!m.active) {
+        await bot.answerCallbackQuery(q.id, { text: 'Model ini belum aktif, pilih yang lain ya.' });
+        return;
+      }
       if (s.picks.includes(m.id)) s.picks = s.picks.filter((x) => x !== m.id);
       else {
         if (s.picks.length >= s.needPick) {
@@ -243,9 +276,8 @@ bot.on('callback_query', async (q) => {
         s.picks.push(m.id);
       }
       const p = getPlan(s.planId);
-      const label = (p && p.pool === 'mid' ? 'model menengah' : 'model mahal');
-      await bot.editMessageText('Paket ' + (p ? p.name : '') + ' — pilih TEPAT ' + s.needPick + ' ' + label + ':',
-        { chat_id: chatId, message_id: msgId, reply_markup: pickerKeyboard(s) });
+      await bot.editMessageText(pickerText(s, p),
+        { chat_id: chatId, message_id: msgId, reply_markup: pickerKeyboard(s), parse_mode: 'HTML' });
       await bot.answerCallbackQuery(q.id);
     } else if (data.startsWith('ap:') || data.startsWith('rj:')) {
       // Hanya admin yang boleh menyetujui/menolak
