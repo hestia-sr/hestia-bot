@@ -51,7 +51,7 @@ const FALLBACK_PLANS = [
   { id: 'vip-8m', name: 'VIP', price: 50000, tokens: 8000000, durationDays: 30, maxModels: 9999, maxKeys: 20, desc: '8M token • 30 hari • FULL model' },
   { id: 'sultan', name: 'SULTAN', price: 350000, tokens: 1500000, durationDays: 30, maxModels: 8, maxKeys: 50, sultan: true, pick: 0, desc: '1,5M token • 30 hari • semua model mahal aktif' },
   { id: 'sultan-plus', name: 'SULTAN+', price: 150000, tokens: 1000000, durationDays: 30, maxModels: 3, maxKeys: 50, sultan: true, pick: 3, pool: 'mahal', desc: '1M token • 30 hari • pilih 3 model mahal' },
-  { id: 'sultan-plus2', name: 'SULTAN++', price: 100000, tokens: 1000000, durationDays: 30, maxModels: 5, maxKeys: 50, sultan: true, pick: 5, pool: 'mid', desc: '1M token • 30 hari • pilih 5 model menengah' },
+  { id: 'sultan-plus2', name: 'SULTAN++', price: 100000, tokens: 1000000, durationDays: 30, maxModels: 5, maxKeys: 50, sultan: true, pick: 5, pool: 'mid', desc: '1M token • 30 hari • pilih 5 model menengah + bonus' },
 ];
 let plansCache = FALLBACK_PLANS;
 async function refreshPlans() {
@@ -118,7 +118,8 @@ function pickerKeyboard(s) {
     // model belum aktif diberi label jelas dan tidak bisa dipilih.
     if (!m.active) return [{ text: m.alias + ' (belum aktif)', callback_data: 'pk:' + i }];
     const on = s.picks.includes(m.id);
-    return [{ text: (on ? '[x] ' : '[ ] ') + m.alias, callback_data: 'pk:' + i }];
+    const tag = m.bonus ? ' (bonus)' : '';
+    return [{ text: (on ? '[x] ' : '[ ] ') + m.alias + tag, callback_data: 'pk:' + i }];
   });
   rows.push([{ text: 'Selesai pilih (' + s.picks.length + '/' + s.needPick + ')', callback_data: 'pk:done' }]);
   rows.push([{ text: 'Batal', callback_data: 'menu:buy' }]);
@@ -128,8 +129,12 @@ function pickerKeyboard(s) {
 // Teks pesan di atas picker (parse_mode HTML agar coretan <s> tampil).
 // Menampilkan SEMUA model; yang belum aktif dicoreng + dijelaskan.
 function pickerText(s, p) {
+  const isPlus2 = p && p.id === 'sultan-plus2';
   const label = (p && p.pool === 'mid') ? 'model menengah' : 'model mahal';
-  let text = 'Paket ' + p.name + ' — pilih TEPAT ' + s.needPick + ' ' + label + ':\n(Ketuk untuk centang/hapus centang)';
+  let text = 'Paket ' + p.name + ' — pilih TEPAT ' + s.needPick + ' ' + (isPlus2 ? 'model' : label) + ':\n(Ketuk untuk centang/hapus centang)';
+  if (isPlus2) {
+    text += '\n\nTermasuk bonus 1 model sedikit lebih tinggi (lumayan buat coding).';
+  }
   const inactive = s.poolList.filter((m) => !m.active);
   if (inactive.length) {
     text += '\n\nYang dicoreng belum aktif ya:\n' +
@@ -147,7 +152,11 @@ async function startPicker(chatId, msgId, plan) {
   }
   const poolKey = plan.pool === 'mid' ? 'mid' : 'mahal';
   // Tampilkan SEMUA model (aktif + belum aktif); yang belum aktif tidak bisa dipilih.
-  const list = r.pools[poolKey] || [];
+  // SULTAN++ dapat bonus 1 model sedikit lebih tinggi (lumayan buat coding).
+  let list = r.pools[poolKey] || [];
+  if (plan.id === 'sultan-plus2' && r.pools.plus2Bonus) {
+    list = list.concat(r.pools.plus2Bonus.map((m) => Object.assign({}, m, { bonus: true })));
+  }
   const activeCount = list.filter((m) => m.active).length;
   if (activeCount < plan.pick) {
     // Jujur: paket belum bisa dibeli — jangan biarkan pembeli nyangkut tanpa penjelasan.
