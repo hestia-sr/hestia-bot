@@ -3,7 +3,7 @@
  * Alur: /start -> Beli Paket -> (pilih model Sultan bila perlu) -> Gmail
  * -> bayar via DANA -> kirim bukti -> admin Setujui/Tolak -> key otomatis.
  *
- * Env: BOT_TOKEN, GATEWAY_URL, BOT_API_TOKEN, ADMIN_CHAT_ID, DATA_DIR
+ * Env: BOT_TOKEN, GATEWAY_URL, BRIDGE_URL, BOT_API_TOKEN, ADMIN_CHAT_ID, DATA_DIR
  */
 const fs = require('fs');
 const path = require('path');
@@ -11,12 +11,29 @@ const TelegramBot = require('node-telegram-bot-api');
 
 const BOT_TOKEN = String(process.env.BOT_TOKEN || '').trim();
 const GATEWAY_URL = String(process.env.GATEWAY_URL || 'https://hestia-gateway-production.up.railway.app').replace(/\/+$/, '');
+const BRIDGE_URL = String(process.env.BRIDGE_URL || 'https://hestia-bridge-production.up.railway.app').replace(/\/+$/, '');
 const BOT_API_TOKEN = String(process.env.BOT_API_TOKEN || '').trim();
 const ADMIN_CHAT_ID = String(process.env.ADMIN_CHAT_ID || '').trim();
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const DANA_QR = path.join(__dirname, 'assets', 'dana-qr.jpg');
 const DANA_NUMBER = '083124856095';
 const ORDERS_FILE = path.join(DATA_DIR, 'orders.json');
+
+/* Paket durasi Bridge: key = durasi hari */
+const BRIDGE_DURATIONS = {
+  1: { plan: '1hari', label: '1 Hari', price: 5000 },
+  3: { plan: '3hari', label: '3 Hari', price: 10000 },
+  7: { plan: '1minggu', label: '1 Minggu', price: 15000 },
+};
+function rp(n) { return 'Rp ' + Number(n).toLocaleString('id-ID'); }
+async function bridge(pathname, opts) {
+  const r = await fetch(BRIDGE_URL + pathname, {
+    ...(opts || {}),
+    headers: { 'Content-Type': 'application/json', 'x-bot-token': BOT_API_TOKEN, ...(((opts || {}).headers) || {}) },
+  });
+  const j = await r.json().catch(() => ({}));
+  return { http: r.status, ...j };
+}
 
 if (!BOT_TOKEN) {
   console.error('[hestia-bot] BOT_TOKEN belum diisi. Isi di Railway Variables lalu restart service.');
@@ -216,11 +233,41 @@ bot.onText(/\/start/, async (msg) => {
   const chatId = msg.chat.id;
   console.log('[hestia-bot] /start dari chat_id=' + chatId + ' user=' + (msg.from.username || msg.from.first_name || '?'));
   sessions.delete(chatId);
+  // Deep link dari web Bridge: /start durasi_1 / durasi_3 / durasi_7
+  const parts = (msg.text || '').trim().split(/\s+/);
+  const arg = parts[1] || '';
+  const mDur = arg.match(/^durasi_(\d+)$/);
+  if (mDur && BRIDGE_DURATIONS[mDur[1]]) {
+    await startBridgeOrder(chatId, mDur[1]);
+    return;
+  }
   await refreshPlans();
   await bot.sendMessage(chatId,
     'Selamat datang di Hestia Gateway!\n\nBeli paket API key AI di sini. Pembayaran via DANA, key dikirim otomatis setelah admin menyetujui bukti bayar.',
     BTN.menu());
 });
+
+/* ---------- Bridge: beli durasi akun ---------- */
+async function startBridgeOrder(chatId, durKey) {
+  const d = BRIDGE_DURATIONS[durKey];
+  sessions.set(chatId, { step: 'bridge_email', bridgeDur: durKey });
+  await bot.sendMessage(chatId,
+    'Tambah durasi akun Hestia Bridge\n\nPaket: ' + d.label + '\nHarga: ' + rp(d.price) + '\n\nKetik Gmail yang terdaftar di web Hestia Bridge:');
+}
+async function sendBridgePayment(chatId, s) {
+  const d = BRIDGE_DURATIONS[s.bridgeDur];
+  s.step = 'bridge_proof';
+  const caption = 'Bayar ' + rp(d.price) + ' via DANA ke ' + DANA_NUMBER + '\n\nPaket: Tambah durasi ' + d.label + ' (' + s.email + ')\n\nSetelah transfer, kirim FOTO bukti pembayaran ke sini.';
+  try {
+    await bot.sendPhoto(chatId, DANA_QR, { caption });
+  } catch (e) {
+    await bot.sendMessage(chatId, caption + '\n\nTransfer via DANA ke ' + DANA_NUMBER);
+  }
+}
+function bridgeOrderText(o) {
+  const d = BRIDGE_DURATIONS[o.bridgeDur] || {};
+  return 'BRIDGE — Tambah Durasi\nID: ' + o.id + '\nPaket: ' + (d.label || o.bridgeDur) + ' (' + rp(d.price || 0) + ')\nEmail: ' + o.email;
+}
 
 /* ---------- callback ---------- */
 bot.on('callback_query', async (q) => {
@@ -303,6 +350,27 @@ bot.on('callback_query', async (q) => {
         return;
       }
       if (approve) {
+        // Order Bridge: perpanjang durasi akun otomatis
+        if (o.kind === 'bridge') {
+          const d = BRIDGE_DURATIONS[o.bridgeDur];
+          const r = await bridge('/api/bot/extend', {
+            method: 'POST',
+            body: JSON.stringify({ email: o.email, plan: d.plan }),
+          });
+          if (!r.ok) {
+            await bot.answerCallbackQuery(q.id, { text: 'Gagal perpanjang: ' + (r.msg || 'error') });
+            await bot.sendMessage(chatId, 'Gagal perpanjang durasi untuk ' + o.id + ': ' + (r.msg || 'error') + '. Perpanjang manual via dashboard Bridge.');
+            return;
+          }
+          o.status = 'approved'; saveOrders(orders);
+          const sampai = r.planExpiresAt ? new Date(r.planExpiresAt).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' }) : '-';
+          await bot.sendMessage(o.buyerChatId,
+            'Pembayaran disetujui. Durasi akun Hestia Bridge kamu sudah nambah otomatis:\n\nPaket: ' + d.label + '\nAkun: ' + o.email + '\nAktif sampai: ' + sampai + ' WIB\n\nTerima kasih!');
+          await bot.editMessageCaption(bridgeOrderText(o) + '\n\nStatus: DISETUJUI',
+            { chat_id: chatId, message_id: msgId });
+          await bot.answerCallbackQuery(q.id, { text: 'Disetujui, durasi otomatis nambah.' });
+          return;
+        }
         const p = getPlan(o.planId);
         const r = await gw('/api/bot/keys', {
           method: 'POST',
@@ -328,9 +396,10 @@ bot.on('callback_query', async (q) => {
         await bot.answerCallbackQuery(q.id, { text: 'Disetujui, key terkirim ke pembeli.' });
       } else {
         o.status = 'rejected'; saveOrders(orders);
+        const capFn = o.kind === 'bridge' ? bridgeOrderText : orderText;
         await bot.sendMessage(o.buyerChatId,
           'Maaf, bukti pembayaran untuk pesanan ' + o.id + ' ditolak admin.\nPastikan nominal transfer pas dan bukti valid, lalu buat pesanan baru dengan /start.');
-        await bot.editMessageCaption(orderText(o) + '\n\nStatus: DITOLAK',
+        await bot.editMessageCaption(capFn(o) + '\n\nStatus: DITOLAK',
           { chat_id: chatId, message_id: msgId });
         await bot.answerCallbackQuery(q.id, { text: 'Ditolak.' });
       }
@@ -346,6 +415,29 @@ bot.on('message', async (msg) => {
   if (!msg.text || msg.text.startsWith('/')) return;
   const chatId = msg.chat.id;
   const s = sess(chatId);
+  // Alur Bridge: input email untuk tambah durasi
+  if (s.step === 'bridge_email') {
+    const email = msg.text.trim().toLowerCase();
+    if (!/^[^@\s]+@gmail\.com$/.test(email)) {
+      await bot.sendMessage(chatId, 'Itu bukan Gmail yang valid. Ketik lagi Gmail kamu (contoh: nama@gmail.com).');
+      return;
+    }
+    const r = await bridge('/api/bot/user?email=' + encodeURIComponent(email));
+    if (!r.ok) { await bot.sendMessage(chatId, 'Bridge error: ' + (r.msg || 'coba lagi nanti.')); return; }
+    if (!r.exists) {
+      await bot.sendMessage(chatId, 'Email ' + email + ' belum terdaftar di Hestia Bridge.\nDaftar dulu di ' + BRIDGE_URL + ' lalu ketik lagi Gmail kamu di sini.');
+      return;
+    }
+    if (r.suspended) {
+      await bot.sendMessage(chatId, 'Akun ' + email + ' sedang di-suspend. Hubungi admin.');
+      sessions.delete(chatId);
+      return;
+    }
+    s.email = email;
+    s.buyerName = (msg.from.username ? '@' + msg.from.username : msg.from.first_name || 'Tanpa Nama');
+    await sendBridgePayment(chatId, s);
+    return;
+  }
   if (s.step !== 'await_email') return;
   const email = msg.text.trim().toLowerCase();
   if (!/^[^@\s]+@gmail\.com$/.test(email)) {
@@ -372,6 +464,40 @@ bot.on('message', async (msg) => {
 bot.on('photo', async (msg) => {
   const chatId = msg.chat.id;
   const s = sess(chatId);
+  // Alur Bridge: bukti bayar tambah durasi
+  if (s.step === 'bridge_proof' && s.email && s.bridgeDur) {
+    const d = BRIDGE_DURATIONS[s.bridgeDur];
+    const photo = msg.photo[msg.photo.length - 1];
+    const orders = loadOrders();
+    const order = {
+      id: 'TG-' + Date.now().toString(36).toUpperCase(),
+      kind: 'bridge',
+      buyerChatId: chatId,
+      buyerName: s.buyerName || (msg.from.username ? '@' + msg.from.username : msg.from.first_name || '?'),
+      email: s.email, bridgeDur: s.bridgeDur, price: d.price,
+      photoFileId: photo.file_id,
+      status: 'pending', ts: Date.now(),
+    };
+    orders.unshift(order); saveOrders(orders);
+    sessions.delete(chatId);
+    if (!ADMIN_CHAT_ID) {
+      await bot.sendMessage(chatId, 'Bukti diterima dan tersimpan. Admin belum terhubung — pesananmu diproses setelah admin terhubung.');
+      return;
+    }
+    try {
+      await bot.sendPhoto(ADMIN_CHAT_ID, photo.file_id, {
+        caption: bridgeOrderText(order),
+        reply_markup: { inline_keyboard: [[
+          { text: 'Setujui', callback_data: 'ap:' + order.id },
+          { text: 'Tolak', callback_data: 'rj:' + order.id },
+        ]] },
+      });
+      await bot.sendMessage(chatId, 'Bukti pembayaran diterima. Menunggu verifikasi admin — durasi akun otomatis nambah setelah disetujui.');
+    } catch (e) {
+      await bot.sendMessage(chatId, 'Bukti tersimpan, tapi gagal diteruskan ke admin saat ini. Coba kirim ulang nanti.');
+    }
+    return;
+  }
   if (s.step !== 'await_proof' || !s.email || !s.planId) {
     await bot.sendMessage(chatId, 'Kamu belum punya pesanan aktif. Ketik /start untuk mulai.');
     return;
